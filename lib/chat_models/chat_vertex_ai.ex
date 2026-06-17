@@ -598,7 +598,9 @@ defmodule LangChain.ChatModels.ChatVertexAI do
         # Google AI uses `finishReason: "STOP` for all messages in the stream.
         # This field can't be used to terminate the list of deltas, so simulate
         # this behavior by forcing the final delta to have `status: :complete`.
-        complete_final_delta(data)
+        data
+        |> reindex_tool_calls()
+        |> complete_final_delta()
 
       {:error, %LangChainError{} = error} ->
         {:error, error}
@@ -638,6 +640,36 @@ defmodule LangChain.ChatModels.ChatVertexAI do
   def complete_final_delta(data) when is_list(data) do
     update_in(data, [Access.at(-1), Access.at(-1)], &%{&1 | status: :complete})
   end
+
+  # Gemini streams each function call as a complete part (full name + args), and
+  # parallel calls arrive across separate chunks with no per-call index. The
+  # index-keyed MessageDelta.merge_tool_calls/2 then folds every nil-indexed call
+  # into the first, concatenating their names (e.g. "fooBaranimate") so the merged
+  # call matches no tool. Because each delta's calls are already complete (never
+  # fragments needing reassembly), we can assign a stream-global index in arrival
+  # order across all chunks, keeping distinct calls — including repeats of the
+  # same tool — distinct through the merge.
+  @spec reindex_tool_calls([[MessageDelta.t()]]) :: [[MessageDelta.t()]]
+  def reindex_tool_calls(data) when is_list(data) do
+    {reindexed, _next} =
+      Enum.map_reduce(data, 0, fn deltas, acc ->
+        Enum.map_reduce(deltas, acc, &reindex_delta/2)
+      end)
+
+    reindexed
+  end
+
+  defp reindex_delta(%MessageDelta{tool_calls: calls} = delta, acc)
+       when is_list(calls) and calls != [] do
+    {reindexed, next} =
+      Enum.map_reduce(calls, acc, fn %ToolCall{} = call, index ->
+        {%ToolCall{call | index: index}, index + 1}
+      end)
+
+    {%MessageDelta{delta | tool_calls: reindexed}, next}
+  end
+
+  defp reindex_delta(other, acc), do: {other, acc}
 
   def do_process_response(model, response, message_type \\ Message)
 
@@ -730,18 +762,11 @@ defmodule LangChain.ChatModels.ChatVertexAI do
       ContentPart.new!(%{type: :text, content: part["text"]})
     end)
 
-    # Gemini returns parallel function calls as distinct parts within one
-    # streamed chunk, each carrying its complete name + args. The part itself has
-    # no index, so without one every tool-call delta defaults to nil and
-    # MessageDelta.merge_tool_calls/2 (which matches by index) collapses them all
-    # into the first call — concatenating their names (e.g. "fooBar"). Assign each
-    # part its position so distinct calls stay distinct through the merge.
     tool_calls_from_parts =
       parts
       |> filter_parts_for_types(["functionCall"])
-      |> Enum.with_index()
-      |> Enum.map(fn {part, index} ->
-        do_process_response(model, Map.put(part, "index", index), nil)
+      |> Enum.map(fn part ->
+        do_process_response(model, part, nil)
       end)
 
     %{
