@@ -808,6 +808,38 @@ defmodule ChatModels.ChatVertexAITest do
       assert struct.status == :incomplete
     end
 
+    test "keeps parallel function-call deltas distinct via per-part index", %{model: model} do
+      response = %{
+        "candidates" => [
+          %{
+            "content" => %{
+              "role" => "model",
+              "parts" => [
+                %{"functionCall" => %{"args" => %{"a" => 1}, "name" => "animate_element"}},
+                %{"functionCall" => %{"args" => %{"b" => 2}, "name" => "add_audio"}}
+              ]
+            },
+            "index" => 0
+          }
+        ]
+      }
+
+      assert [%MessageDelta{tool_calls: [first, second]} = delta] =
+               ChatVertexAI.do_process_response(model, response, MessageDelta)
+
+      # Each part gets its position, so the index-keyed merge can't collapse them.
+      assert %ToolCall{index: 0, name: "animate_element"} = first
+      assert %ToolCall{index: 1, name: "add_audio"} = second
+
+      # The bug this guards: with both indices nil, merge_deltas/1 folded the two
+      # complete calls into one and concatenated their names ("animate_elementadd_audio").
+      assert %MessageDelta{tool_calls: [merged_first, merged_second]} =
+               MessageDelta.merge_deltas([delta])
+
+      assert merged_first.name == "animate_element"
+      assert merged_second.name == "add_audio"
+    end
+
     test "handles API error messages", %{model: model} do
       response = %{
         "error" => %{

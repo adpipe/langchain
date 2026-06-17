@@ -730,11 +730,18 @@ defmodule LangChain.ChatModels.ChatVertexAI do
       ContentPart.new!(%{type: :text, content: part["text"]})
     end)
 
+    # Gemini returns parallel function calls as distinct parts within one
+    # streamed chunk, each carrying its complete name + args. The part itself has
+    # no index, so without one every tool-call delta defaults to nil and
+    # MessageDelta.merge_tool_calls/2 (which matches by index) collapses them all
+    # into the first call — concatenating their names (e.g. "fooBar"). Assign each
+    # part its position so distinct calls stay distinct through the merge.
     tool_calls_from_parts =
       parts
       |> filter_parts_for_types(["functionCall"])
-      |> Enum.map(fn part ->
-        do_process_response(model, part, nil)
+      |> Enum.with_index()
+      |> Enum.map(fn {part, index} ->
+        do_process_response(model, Map.put(part, "index", index), nil)
       end)
 
     %{
