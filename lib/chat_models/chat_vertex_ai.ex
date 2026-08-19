@@ -701,7 +701,9 @@ defmodule LangChain.ChatModels.ChatVertexAI do
         # Google AI uses `finishReason: "STOP` for all messages in the stream.
         # This field can't be used to terminate the list of deltas, so simulate
         # this behavior by forcing the final delta to have `status: :complete`.
-        complete_final_delta(data)
+        data
+        |> reindex_tool_calls()
+        |> complete_final_delta()
 
       {:error, %LangChainError{} = error} ->
         {:error, error}
@@ -742,6 +744,36 @@ defmodule LangChain.ChatModels.ChatVertexAI do
   def complete_final_delta(data) when is_list(data) do
     update_in(data, [Access.at(-1), Access.at(-1)], &%{&1 | status: :complete})
   end
+
+  # Gemini streams each function call as a complete part (full name + args), and
+  # parallel calls arrive across separate chunks with no per-call index. The
+  # index-keyed MessageDelta.merge_tool_calls/2 then folds every nil-indexed call
+  # into the first, concatenating their names (e.g. "fooBaranimate") so the merged
+  # call matches no tool. Because each delta's calls are already complete (never
+  # fragments needing reassembly), we can assign a stream-global index in arrival
+  # order across all chunks, keeping distinct calls — including repeats of the
+  # same tool — distinct through the merge.
+  @spec reindex_tool_calls([[MessageDelta.t()]]) :: [[MessageDelta.t()]]
+  def reindex_tool_calls(data) when is_list(data) do
+    {reindexed, _next} =
+      Enum.map_reduce(data, 0, fn deltas, acc ->
+        Enum.map_reduce(deltas, acc, &reindex_delta/2)
+      end)
+
+    reindexed
+  end
+
+  defp reindex_delta(%MessageDelta{tool_calls: calls} = delta, acc)
+       when is_list(calls) and calls != [] do
+    {reindexed, next} =
+      Enum.map_reduce(calls, acc, fn %ToolCall{} = call, index ->
+        {%ToolCall{call | index: index}, index + 1}
+      end)
+
+    {%MessageDelta{delta | tool_calls: reindexed}, next}
+  end
+
+  defp reindex_delta(other, acc), do: {other, acc}
 
   def do_process_response(model, response, message_type \\ Message)
 

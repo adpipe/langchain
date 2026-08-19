@@ -995,6 +995,53 @@ defmodule ChatModels.ChatVertexAITest do
     end
   end
 
+  describe "reindex_tool_calls/1" do
+    defp delta_with_calls(names) do
+      [
+        %MessageDelta{
+          role: :assistant,
+          status: :incomplete,
+          tool_calls:
+            Enum.map(
+              names,
+              &ToolCall.new!(%{name: &1, arguments: %{}, index: nil, complete: true})
+            )
+        }
+      ]
+    end
+
+    test "assigns stream-global indices so parallel calls survive the merge" do
+      # Gemini streams each complete call with no index (arriving as separate
+      # chunks, or several parts in one). All would land index: nil and the
+      # index-keyed merge would collapse them, concatenating names. Repeats of the
+      # same tool name must also stay distinct.
+      data = [
+        delta_with_calls(["set_canvas_background"]),
+        delta_with_calls(["animate_element", "animate_element"]),
+        delta_with_calls(["add_audio"])
+      ]
+
+      merged =
+        data
+        |> ChatVertexAI.reindex_tool_calls()
+        |> List.flatten()
+        |> MessageDelta.merge_deltas()
+
+      assert [first, second, third, fourth] = merged.tool_calls
+      assert {0, "set_canvas_background"} == {first.index, first.name}
+      assert {1, "animate_element"} == {second.index, second.name}
+      assert {2, "animate_element"} == {third.index, third.name}
+      assert {3, "add_audio"} == {fourth.index, fourth.name}
+    end
+
+    test "leaves text-only deltas untouched" do
+      data = [[%MessageDelta{role: :assistant, status: :incomplete, content: "hi", tool_calls: nil}]]
+
+      assert [[%MessageDelta{content: "hi", tool_calls: nil}]] =
+               ChatVertexAI.reindex_tool_calls(data)
+    end
+  end
+
   describe "filter_parts_for_types/2" do
     test "returns a single functionCall type" do
       parts = [
